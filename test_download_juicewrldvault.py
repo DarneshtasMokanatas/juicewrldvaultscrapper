@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 import download_juicewrldvault as vault
 
+FRAME = b"\xff\xfb\x90\x00" + bytes(413)
+AUDIO = FRAME * 2
+
 
 class Response(io.BytesIO):
     def __init__(self, data, status=200, content_type="audio/mpeg", **headers):
@@ -45,37 +48,37 @@ class DownloaderTests(unittest.TestCase):
         self.url = "https://example.invalid/song"
 
     def test_complete_download_then_skip(self):
-        client = FakeClient(Response(b"abcdef", Content_Length="6"))
+        client = FakeClient(Response(AUDIO, Content_Length=str(len(AUDIO))))
         self.assertEqual(vault.download(client, self.url, self.target, "audio"), "downloaded")
-        self.assertEqual(self.target.read_bytes(), b"abcdef")
+        self.assertEqual(self.target.read_bytes(), AUDIO)
         self.assertEqual(vault.download(client, self.url, self.target, "audio"), "skipped")
 
     def seed_partial(self, state=None):
         part = self.target.with_name("song.mp3.part")
-        part.write_bytes(b"abc")
+        part.write_bytes(FRAME)
         vault.save_json(part.with_name(part.name + ".json"), state if state is not None else {
             "url": self.url, "validator": '"v1"'
         })
 
     def test_range_resume(self):
         self.seed_partial()
-        client = FakeClient(Response(b"def", 206, Content_Range="bytes 3-5/6"))
+        client = FakeClient(Response(FRAME, 206, Content_Range=f"bytes 417-833/834"))
         vault.download(client, self.url, self.target, "audio")
-        self.assertEqual(client.headers, {"Range": "bytes=3-", "If-Range": '"v1"'})
-        self.assertEqual(self.target.read_bytes(), b"abcdef")
+        self.assertEqual(client.headers, {"Range": "bytes=417-", "If-Range": '"v1"'})
+        self.assertEqual(self.target.read_bytes(), AUDIO)
 
     def test_server_ignores_range_restarts_file(self):
         self.seed_partial()
-        client = FakeClient(Response(b"new", Content_Length="3"))
+        client = FakeClient(Response(AUDIO, Content_Length=str(len(AUDIO))))
         vault.download(client, self.url, self.target, "audio")
-        self.assertEqual(self.target.read_bytes(), b"new")
+        self.assertEqual(self.target.read_bytes(), AUDIO)
 
     def test_invalid_resume_state_restarts_file(self):
         self.seed_partial(["invalid", "state"])
-        client = FakeClient(Response(b"new", Content_Length="3"))
+        client = FakeClient(Response(AUDIO, Content_Length=str(len(AUDIO))))
         vault.download(client, self.url, self.target, "audio")
         self.assertEqual(client.headers, {})
-        self.assertEqual(self.target.read_bytes(), b"new")
+        self.assertEqual(self.target.read_bytes(), AUDIO)
 
     def test_incomplete_download_is_not_published(self):
         client = FakeClient(Response(b"abc", Content_Length="6"))
@@ -142,7 +145,7 @@ class DownloaderTests(unittest.TestCase):
         output = Path(self.folder.name)
         (output / "songs").mkdir()
         identifier = vault.song_identifier("song-1")
-        (output / "songs" / f"Old title [{identifier}].mp3").write_bytes(b"audio")
+        (output / "songs" / f"Old title [{identifier}].mp3").write_bytes(AUDIO)
         history = vault.DownloadHistory(output / "history.json")
         found = history.scan([{"id": "song-1", "title": "New title"}], output)
         self.assertEqual(found, {"audio": 1, "image": 0})

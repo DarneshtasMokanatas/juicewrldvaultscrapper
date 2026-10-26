@@ -6,6 +6,9 @@ It saves catalog metadata, retries temporary network failures, and skips files
 it has already downloaded. No account, API key, or additional Python packages
 are required.
 
+Version **1.3.0** adds track selection, targeted recovery, file verification,
+process locks, and live progress to concurrent downloading and persistent history.
+
 This is an unofficial tool. It downloads public catalog tracks, rather than
 mirroring the entire website or discovering hidden files. The site's endpoints
 can change, so catalog size and availability can vary.
@@ -51,6 +54,62 @@ The default output folder is `Downloads/juicewrldvault` under your home folder.
 The script prints the absolute location at startup. A large catalog can take
 considerable time and disk space; the script does not estimate its total size.
 
+## Find and select tracks
+
+List matching tracks and their catalog IDs before downloading:
+
+```powershell
+py -3 .\download_juicewrldvault.py --list-only --search "night"
+py -3 .\download_juicewrldvault.py --list-only --type instrumental
+```
+
+`--search` matches a case-insensitive substring in the title or author.
+`--type` accepts `all`, `songs`, `raw`, or `instrumental`, based on membership in
+the site's catalog pools. A track can belong to more than one pool.
+`--list-only` always saves the complete catalog and prints only the matches.
+
+Copy an ID from that listing in place of `TRACK_ID`, or combine filters:
+
+```powershell
+py -3 .\download_juicewrldvault.py --song-id TRACK_ID --artwork
+py -3 .\download_juicewrldvault.py --search "night" --type raw --limit 5
+```
+
+Repeat `--song-id` to choose multiple IDs. Exact IDs, text, and type filters
+intersect; `--limit` applies after filtering in catalog order. Unknown explicit
+IDs cause an error before any media downloads.
+
+## Retry or replace files
+
+Retry just the unfinished files recorded in the chosen output folder:
+
+```powershell
+py -3 .\download_juicewrldvault.py --output "D:\Music\Juice Vault" --retry-failed
+```
+
+This also retries failed artwork without requiring `--artwork`, and resumes
+partial files when the server supports it. URLs and destinations are rebuilt
+from the current catalog, so reports from older versions and moved folders can
+be used. Add `--song-id`, `--search`, `--type`, or `--limit` to narrow retries;
+unselected failures stay in the report. IDs no longer available in the catalog
+are reported and retained while other available files are retried.
+
+To fetch a specific track afresh even if it is already in history:
+
+```powershell
+py -3 .\download_juicewrldvault.py --redownload TRACK_ID
+py -3 .\download_juicewrldvault.py --redownload TRACK_ID --artwork
+```
+
+Repeat `--redownload` for multiple IDs. It bypasses history and discards that
+selection's previous partial transfer. Add `--artwork` to replace its cover too.
+An existing completed file remains until its replacement passes verification;
+failed replacements stay in `failures.json` for `--retry-failed`. The replacement
+uses the current catalog filename; an older copy with a different title is kept.
+If both ID flags are used, their IDs form the selection, and only IDs passed to
+`--redownload` are forced. It cannot be combined with `--retry-failed`,
+`--list-only`, or `--sync-history`.
+
 ## Choose an output folder
 
 ```powershell
@@ -71,10 +130,15 @@ are restricted by the operating system.
 | --- | --- | --- |
 | `--output PATH` | Sets the output folder | `~/Downloads/juicewrldvault` |
 | `--artwork` | Downloads each track's cover as a separate image | Off |
-| `--list-only` | Saves the full catalog without downloading music or images | Off |
+| `--list-only` | Saves the full catalog and prints matching tracks and IDs without downloading media | Off |
 | `--history PATH` | Sets the persistent download history file | `~/.juicewrldvault/downloaded_songs.json` |
 | `--sync-history` | Records existing files from the local catalog and exits without network access | Off |
-| `--limit N` | Processes only the first N catalog tracks | All tracks |
+| `--search TEXT` | Matches title or author, ignoring case | All tracks |
+| `--song-id ID` | Selects an exact ID; may be repeated | All tracks |
+| `--type TYPE` | Filters by `all`, `songs`, `raw`, or `instrumental` catalog pools | `all` |
+| `--retry-failed` | Retries only unfinished files in `failures.json` | Off |
+| `--redownload ID` | Fetches an ID afresh, ignoring history; may be repeated | Off |
+| `--limit N` | Processes only the first N matching tracks | All matches |
 | `--workers N` | Sets simultaneous file downloads (1–32) | `6` |
 | `--delay SECONDS` | Sets minimum request-start spacing across all workers | `0.1` |
 | `--retries N` | Sets retry attempts after the initial request | `4` |
@@ -92,12 +156,19 @@ Use `--workers 1` for sequential downloads, or adjust concurrency with:
 py -3 .\download_juicewrldvault.py --workers 8 --delay 0.1
 ```
 
+Progress shows separate song/artwork downloaded, skipped, and failed counts,
+average transferred MiB/s, elapsed time, and an estimated time remaining.
+The estimate uses completed-file timing and starts after the first completion;
+file sizes and retries can make it fluctuate. The transfer rate includes bytes
+sent again during retries. The elapsed timer covers the media phase.
+
 ## Output and resuming
 
 ```text
 juicewrldvault/
   catalog.json       Full track metadata returned by the site
-  failures.json      Failed files from the most recently completed run
+  failures.json      Unresolved failed, queued, or interrupted files
+  .download.lock     Output-folder lock (leave this file in place)
   songs/            MP3 files with track IDs to distinguish versions
   artwork/          Cover images, when --artwork is used
 ```
@@ -105,17 +176,26 @@ juicewrldvault/
 Press **Ctrl+C** to stop. Run the same command with the same output folder to
 continue. Completed IDs are saved to a persistent history file outside the media
 folder, so moving or renaming downloaded music does not cause it to download
-again. Existing nonempty files with their original ID suffixes are also recorded
-automatically. Interrupted files remain as
+again. Existing files with their original ID suffixes are checked and valid ones
+are recorded automatically. Interrupted files remain as
 `.part` files with `.part.json` metadata. They resume when the server provides
 the required range and validation headers; otherwise they restart safely.
 Keep these files if you plan to resume.
 
-Existing files are checked for presence and nonzero size, not checked against a
-remote checksum. To replace a corrupted completed file or fetch an updated
-version, remove that file and its ID from the relevant `audio` or `image` list in
-the history JSON, then rerun. Back up the history before editing it. Avoid running
-two copies against the same output folder or history file at the same time.
+Audio checks cover nonempty content, HTTP sizes when supplied, and complete
+MPEG Layer III frames, including MPEG-1/2/2.5, variable bitrates, ID3 tags, and APE
+tags. Free-format MP3 bitrates are unsupported. Artwork uses basic format
+signatures/end markers or container sizes. Newly recorded file sizes are also
+kept in history to detect changed local files. Invalid local copies lose their
+completion record and can be fetched again. Legacy history files remain readable.
+These checks do not decode audio/images or compare against remote checksums;
+they cannot detect every kind of corruption. Moved files remain recorded because
+their contents are no longer available to inspect in the output folder.
+
+The output folder and history each have a process lock, so a second copy cannot
+write to either resource while the first is running, even with a different output
+or history setting. Locks release automatically after exit or a crash. Do not
+delete lock files while a downloader is running; close the other process first.
 
 Before moving music downloaded by an older version, record the existing files
 using the saved `catalog.json` and the original filenames:
@@ -126,15 +206,16 @@ py -3 .\download_juicewrldvault.py --output "D:\Music\Juice Vault" --sync-histor
 
 This operation is offline and requires at least one matching completed song.
 Keep the history file after moving the music. Use the same `--history PATH` for
-future runs if you choose a custom location. `--list-only` and `--sync-history`
-cannot be combined, and the history path must be separate from catalog,
-failure-report, and media paths.
+future runs if you choose a custom location. `--sync-history` cannot be combined
+with selection filters. The history path must be separate from catalog,
+failure-report, lock, temporary, and media paths.
 
-`catalog.json` is refreshed each run. `failures.json` is written when a download
-run finishes; it may be absent or reflect an earlier run after an interruption
-or a `--list-only` run. Rerunning retries failed files while skipping completed
-ones. Exit codes are `0` for success, `1` for download/runtime failures, `2` for
-invalid arguments, and `130` for Ctrl+C.
+`catalog.json` is refreshed on catalog-fetching runs. `failures.json` is saved
+before work starts and after each result, including on interruption. Successful
+files are removed; unrelated unresolved entries remain. `--list-only` and
+`--sync-history` leave that report alone. Exit codes are `0` for a successful
+selection, `1` for download/runtime failures (or unresolved entries after an
+unfiltered retry), `2` for invalid arguments, and `130` for Ctrl+C.
 
 ## Troubleshooting
 
@@ -149,3 +230,18 @@ invalid arguments, and `130` for Ctrl+C.
   may have changed. Retry later; persistent changes require updating the script.
 - **Disk full or very long paths:** Free disk space or choose a shorter output
   path, then rerun with the same output folder.
+- **Cannot lock output/history:** Close the other downloader that uses that
+  folder or history. A leftover lock file itself does not block a new run.
+- **Invalid/unsupported MP3 or artwork:** The response may be incomplete, an
+  error page, or an unsupported format. Review `failures.json` and try
+  `--retry-failed` later; use `--redownload ID` for a fresh transfer.
+
+## Offline tests
+
+```sh
+python -m unittest -v
+```
+
+Tests use synthetic media and mocked network responses, including concurrent
+workers, partial resuming, rate-limit cooldowns, interruption recovery, and
+separate processes contending for locks. They do not download music.
