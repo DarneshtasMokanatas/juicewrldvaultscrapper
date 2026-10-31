@@ -22,7 +22,7 @@ authentication are outside the scope of this script.
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
@@ -41,7 +41,7 @@ from urllib.request import Request, urlopen
 
 BASE = "https://juicewrldvault.com"
 MEDIA = "https://media.juicewrldvault.com"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 TRANSIENT = {408, 425, 429, 500, 502, 503, 504}
 
 
@@ -77,12 +77,12 @@ class Client:
                     return
             self.wait(remaining)
 
-    def open(self, url, headers=None, body=None):
+    def open(self, url, headers=None, body=None, method=None):
         self.pace()
         combined = {"User-Agent": f"VaultCatalogDownloader/{VERSION}",
                     "Accept-Encoding": "identity", "Referer": BASE + "/"}
         combined.update(headers or {})
-        return urlopen(Request(url, data=body, headers=combined), timeout=self.timeout)
+        return urlopen(Request(url, data=body, headers=combined, method=method), timeout=self.timeout)
 
     def backoff(self, attempt, error):
         wait = min(60, 2 ** attempt)
@@ -309,6 +309,8 @@ class DownloadHistory:
         self.path = path
         self.completed = {"audio": set(), "image": set()}
         self.sizes = {"audio": {}, "image": {}}
+        # The catalog path is a change signal, not a guaranteed content hash.
+        self.audio_sources = {}
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -328,22 +330,43 @@ class DownloadHistory:
                             or type(value) is not int or value <= 0 for key, value in records.items())):
                         raise ValueError("invalid size records")
                     self.sizes[kind] = records
+                sources = data.get("audio_sources", {})
+                if (not isinstance(sources, dict) or any(not isinstance(key, str)
+                        or not isinstance(value, str) or not value for key, value in sources.items())):
+                    raise ValueError("invalid audio source records")
+                self.audio_sources = sources
             except (ValueError, KeyError, TypeError) as error:
                 raise RuntimeError(f"Cannot read download history '{path}': {error}. "
                                    "Restore a valid copy before continuing.") from error
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        save_json(self.path, {"version": 1, "sizes": self.sizes,
+        save_json(self.path, {"version": 1, "sizes": self.sizes, "audio_sources": self.audio_sources,
                              **{kind: sorted(ids) for kind, ids in self.completed.items()}})
 
-    def record(self, song_id, kind, path):
+    def record(self, song_id, kind, path, source=None):
         self.sizes[kind][song_id] = validate_media(path, kind)
         self.completed[kind].add(song_id)
+        if kind == "audio" and source:
+            self.audio_sources[song_id] = source
 
     def forget(self, song_id, kind):
         self.completed[kind].discard(song_id)
         self.sizes[kind].pop(song_id, None)
+        # Keep the previous audio source until its replacement succeeds.
+
+    def seed_sources(self, songs, previous):
+        """Use the last saved catalog as a best-effort baseline for legacy history."""
+        current = {str(song["id"]): song.get("song_path") for song in songs}
+        count = 0
+        for song_id in self.completed["audio"]:
+            if song_id in self.audio_sources:
+                continue
+            source = previous.get(song_id) or current.get(song_id)
+            if isinstance(source, str) and source:
+                self.audio_sources[song_id] = source
+                count += 1
+        return count
 
     def scan(self, songs, output):
         # Match stable suffixes even if the catalog's title/author has changed.
@@ -485,6 +508,7 @@ class Job:
     kind: str
     force: bool = False
     fresh: bool = False
+    source: str = ""
 
     @property
     def key(self):
@@ -559,7 +583,8 @@ def build_jobs(songs, args, failures):
         fresh = song_id in (args.redownload or [])
         if not args.retry_failed or (song_id, "audio") in failures:
             jobs.append(Job(song_id, BASE + "/api/download-song?" + urlencode({"id": song_id}),
-                            args.output / "songs" / (stem + ".mp3"), "audio", force, fresh))
+                            args.output / "songs" / (stem + ".mp3"), "audio", force, fresh,
+                            song.get("song_path") if isinstance(song.get("song_path"), str) else ""))
         want_image = ((song_id, "image") in failures if args.retry_failed else args.artwork)
         image = song.get("image_path")
         if want_image and not image and args.retry_failed:
@@ -636,7 +661,8 @@ def run_downloads(client, jobs, history, failure_path, failures, workers, skippe
             return
         try:
             status = future.result()
-            history.record(job.song_id, job.kind, job.destination)
+            history.record(job.song_id, job.kind, job.destination,
+                           job.source if status == "downloaded" else None)
         except (OSError, ValueError, RuntimeError, http.client.HTTPException, DownloadCancelled) as error:
             progress.finish(job.kind, "failed")
             failures[job.key] = job.failure(str(error) or "Interrupted")
@@ -678,6 +704,109 @@ def run_downloads(client, jobs, history, failure_path, failures, workers, skippe
     return 1 if any(progress.counts[kind]["failed"] for kind in progress.counts) else 0
 
 
+def previous_catalog_sources(path):
+    """Read the prior catalog before replacing it; old histories have no source record."""
+    if not path.exists():
+        return {}
+    try:
+        songs = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(songs, list):
+            raise ValueError("expected a list")
+        return {str(song["id"]): song["song_path"] for song in songs
+                if isinstance(song, dict) and song.get("id") is not None
+                and isinstance(song.get("song_path"), str) and song["song_path"]}
+    except (ValueError, OSError) as error:
+        print(f"Warning: Cannot use previous catalog as an update baseline: {error}", file=sys.stderr)
+        return {}
+
+
+def local_audio_sizes(songs, history, output):
+    """Find known sizes without reading audio bytes or following nested folders."""
+    identifiers = {song_identifier(str(song["id"])) + "]": str(song["id"]) for song in songs}
+    sizes = {song_id: {size} for song_id, size in history.sizes["audio"].items()
+             if song_id in history.completed["audio"]}
+    for folder in (output, output / "songs"):
+        if not folder.is_dir():
+            continue
+        for path in folder.iterdir():
+            if path.suffix.lower() != ".mp3" or not path.is_file():
+                continue
+            song_id = identifiers.get(path.stem.rpartition(" [")[2])
+            if song_id in history.completed["audio"]:
+                size = path.stat().st_size
+                if size:
+                    sizes.setdefault(song_id, set()).add(size)
+    return sizes
+
+
+def remote_audio_size(client, song_id):
+    """Use HEAD only; no audio body is transferred."""
+    url = BASE + "/api/download-song?" + urlencode({"id": song_id})
+    for attempt in range(client.retries + 1):
+        try:
+            with client.open(url, method="HEAD") as response:
+                content_type = response.headers.get_content_type()
+                if content_type in {"text/html", "application/json", "text/plain"}:
+                    raise RuntimeError(f"Unexpected {content_type} during update check")
+                value = response.headers.get("Content-Length", "")
+                return int(value) if value.isdigit() and int(value) > 0 else None
+        except (HTTPError, URLError, TimeoutError, ConnectionError,
+                http.client.IncompleteRead) as error:
+            if (isinstance(error, HTTPError) and error.code not in TRANSIENT
+                    or attempt == client.retries):
+                if isinstance(error, HTTPError):
+                    error.close()
+                raise
+            client.backoff(attempt, error)
+
+
+def check_remote_sizes(client, songs, history, output, workers):
+    """Check completed tracks with known local sizes, using bounded concurrent HEADs."""
+    sizes = local_audio_sizes(songs, history, output)
+    candidates = [str(song["id"]) for song in songs if str(song["id"]) in history.completed["audio"]]
+    checkable = [song_id for song_id in candidates if sizes.get(song_id)]
+    unavailable = len(candidates) - len(checkable)
+    if unavailable:
+        print(f"Cannot compare {unavailable} completed tracks: no local or recorded size.", file=sys.stderr)
+    print(f"Checking remote sizes for {len(checkable)} tracks; no audio is downloaded during this check.", flush=True)
+    changed, errors, pending = set(), [], {}
+    remaining = iter(checkable)
+    executor = ThreadPoolExecutor(max_workers=workers)
+    checked, exhausted = 0, False
+    try:
+        while pending or not exhausted:
+            while not exhausted and len(pending) < workers * 2:
+                song_id = next(remaining, None)
+                if song_id is None:
+                    exhausted = True
+                    break
+                pending[executor.submit(remote_audio_size, client, song_id)] = song_id
+            if not pending:
+                break
+            done, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            for future in done:
+                song_id = pending.pop(future)
+                try:
+                    remote_size = future.result()
+                    if remote_size is None:
+                        errors.append(song_id)
+                        print(f"Cannot check ID {song_id}: server gave no usable size.", file=sys.stderr)
+                    elif remote_size not in sizes[song_id]:
+                        changed.add(song_id)
+                except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
+                    errors.append(song_id)
+                    print(f"Cannot check ID {song_id}: {error}", file=sys.stderr)
+                checked += 1
+                if checked % 50 == 0 or checked == len(checkable):
+                    print(f"Checked {checked}/{len(checkable)} tracks; {len(changed)} size changes found.", flush=True)
+    except BaseException:
+        client.stop.set()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return changed, unavailable + len(errors)
+
+
 def run(args):
     if args.sync_history:
         try:
@@ -692,6 +821,7 @@ def run(args):
         if not found["audio"]:
             raise RuntimeError("No valid completed songs matched the local catalog. Check --output "
                                "and keep the original ID suffixes until history is recorded.")
+        history.seed_sources(songs, {})
         history.save()
         print(f"Recorded {found['audio']} songs and {found['image']} artwork files. History: {args.history}")
         return 0
@@ -701,9 +831,17 @@ def run(args):
         print("No failed files to retry.")
         return 0
     history = None if args.list_only else DownloadHistory(args.history)
+    previous = previous_catalog_sources(args.output / "catalog.json") if history else {}
     client = Client(args.delay, args.retries, args.timeout)
     songs = catalog(client)
     selected = select_songs(songs, args, failures)
+    if history:
+        seeded = history.seed_sources(songs, previous)
+        if seeded:
+            print(f"Initialized update tracking for {seeded} existing tracks from available catalog data. "
+                  "Earlier changes may not be detectable.", flush=True)
+        # Save the baseline before replacing the old catalog, even for an empty selection.
+        history.save()
     save_json(args.output / "catalog.json", songs)
     print(f"Catalog: {len(songs)} tracks; selected: {len(selected)}. Saved to {args.output / 'catalog.json'}")
     if args.list_only:
@@ -715,8 +853,18 @@ def run(args):
         print("No tracks matched the selected filters.")
         return 1 if args.retry_failed and failures else 0
     history.scan(songs, args.output)
+    history.seed_sources(songs, previous)
+    size_changes, unchecked = (check_remote_sizes(client, selected, history, args.output, args.workers)
+                               if args.check_updates else (set(), 0))
     jobs, skipped = [], {"audio": 0, "image": 0}
     for job in build_jobs(selected, args, failures):
+        old_source = history.audio_sources.get(job.song_id) if job.kind == "audio" else None
+        if old_source and job.source and old_source != job.source:
+            print(f"Updated audio detected for ID {job.song_id}; downloading the new version.", flush=True)
+            job = replace(job, force=True, fresh=True)
+        elif job.kind == "audio" and job.song_id in size_changes:
+            print(f"Audio size changed for ID {job.song_id}; downloading the new version.", flush=True)
+            job = replace(job, force=True, fresh=True)
         if job.song_id in history.completed[job.kind] and not job.force:
             skipped[job.kind] += 1
             # A preserved original is not proof that a requested replacement succeeded.
@@ -727,7 +875,7 @@ def run(args):
     print(f"Downloading {len(jobs)} files with {args.workers} workers. History: {args.history}")
     result = run_downloads(client, jobs, history, failure_path, failures, args.workers, skipped)
     filtered = args.song_id or args.search or args.track_type != "all" or args.limit
-    return 1 if args.retry_failed and not filtered and failures else result
+    return 1 if unchecked or args.retry_failed and not filtered and failures else result
 
 
 def main():
@@ -752,6 +900,8 @@ def main():
                         default="all", help="Filter using catalog group membership (default: all)")
     parser.add_argument("--redownload", action="append", metavar="ID",
                         help="Fetch an ID again, ignoring history; repeat for multiple IDs")
+    parser.add_argument("--check-updates", action="store_true",
+                        help="Also compare remote sizes of existing tracks (one HEAD request per track)")
     parser.add_argument("--limit", type=int, help="Process the first N matching tracks")
     parser.add_argument("--workers", type=int, default=6, help="Concurrent downloads, 1-32 (default: 6)")
     parser.add_argument("--delay", type=float, default=0.1, help="Shared request-start spacing in seconds (default: 0.1)")
@@ -767,6 +917,8 @@ def main():
         parser.error("--redownload cannot be combined with --list-only, --sync-history or --retry-failed")
     if args.sync_history and (args.search or args.song_id or args.track_type != "all" or args.limit):
         parser.error("--sync-history cannot be combined with selection filters")
+    if args.check_updates and (args.list_only or args.sync_history or args.retry_failed or args.redownload):
+        parser.error("--check-updates cannot be combined with --list-only, --sync-history, --retry-failed or --redownload")
     args.output = args.output.expanduser().resolve()
     args.history = args.history.expanduser().resolve()
     reserved = {args.output / name for name in (

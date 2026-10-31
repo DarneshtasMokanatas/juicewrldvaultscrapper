@@ -6,8 +6,8 @@ It saves catalog metadata, retries temporary network failures, and skips files
 it has already downloaded. No account, API key, or additional Python packages
 are required.
 
-Version **1.3.0** adds track selection, targeted recovery, file verification,
-process locks, and live progress to concurrent downloading and persistent history.
+Version **1.4.0** also tracks catalog audio paths to detect changed versions,
+with an optional remote-size comparison for changes at the same path.
 
 This is an unofficial tool. It downloads public catalog tracks, rather than
 mirroring the entire website or discovering hidden files. The site's endpoints
@@ -110,6 +110,43 @@ If both ID flags are used, their IDs form the selection, and only IDs passed to
 `--redownload` are forced. It cannot be combined with `--retry-failed`,
 `--list-only`, or `--sync-history`.
 
+## Detect updated audio
+
+On a normal download run, the script compares each completed track's current
+`song_path` with its saved source path. If the catalog path changes, the track
+is downloaded again even when its ID is already in history. The old completed
+file remains in place until the replacement passes verification. If you moved
+the old file out of `songs/`, the new copy goes into `songs/` and the moved
+copy is left alone. A failed replacement keeps the old source in history so a
+later run can try again.
+
+Older history contains no source paths. On the first normal run after upgrading,
+the script uses the previous `catalog.json` as a best-effort baseline; where no
+previous path is available, it uses the current path. Run a normal download
+command first, before `--list-only` refreshes the old catalog. Changes that
+occurred before that baseline cannot be reliably identified from history alone.
+
+To also compare remote file sizes with known local or recorded sizes, add
+`--check-updates` to a normal download command:
+
+```powershell
+py -3 .\download_juicewrldvault.py --output "D:\Music\Juice Vault" --check-updates
+```
+
+This uses one HTTP HEAD request per completed selected track with a known size;
+it does not download audio merely to compare it. It checks files with original
+ID suffixes in the output folder and its `songs/` subfolder, as well as sizes
+stored in history. It takes at least about 6½ minutes for 3,900 tracks with the
+default 0.1-second request spacing, plus network and download time. Missing
+sizes or failed checks are reported, and the exit code is `1` if any could not
+be checked. You can narrow the check with `--search`, `--type`, `--song-id`, or
+`--limit`.
+
+A path and size are useful change signals, not content hashes: if the site
+changes audio without changing its path or size, neither check can prove the
+file changed. Use `--redownload ID` for a track you know has changed. The
+download endpoint may not provide an ETag or modification date.
+
 ## Choose an output folder
 
 ```powershell
@@ -138,6 +175,7 @@ are restricted by the operating system.
 | `--type TYPE` | Filters by `all`, `songs`, `raw`, or `instrumental` catalog pools | `all` |
 | `--retry-failed` | Retries only unfinished files in `failures.json` | Off |
 | `--redownload ID` | Fetches an ID afresh, ignoring history; may be repeated | Off |
+| `--check-updates` | Compares remote and known local sizes of completed tracks | Off |
 | `--limit N` | Processes only the first N matching tracks | All matches |
 | `--workers N` | Sets simultaneous file downloads (1–32) | `6` |
 | `--delay SECONDS` | Sets minimum request-start spacing across all workers | `0.1` |

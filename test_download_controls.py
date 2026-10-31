@@ -21,11 +21,11 @@ from test_download_juicewrldvault import AUDIO, FRAME, FakeClient, Response
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(16) + b"\0\0\0\0IEND\xaeB`\x82"
 SONGS = [{"id": "1", "title": "Night Drive", "author": "Juice WRLD",
-          "vault_categories": ["songs"], "image_path": "one.png"},
+          "vault_categories": ["songs"], "song_path": "audio/one-v1.mp3", "image_path": "one.png"},
          {"id": "2", "title": "Night Drive (Raw)", "author": "Juice WRLD",
-          "vault_categories": ["raw"], "image_path": "two.png"},
+          "vault_categories": ["raw"], "song_path": "audio/two-v1.mp3", "image_path": "two.png"},
          {"id": "3", "title": "Studio Beat", "author": "Producer",
-          "vault_categories": ["instrumental"]}]
+          "vault_categories": ["instrumental"], "song_path": "audio/three-v1.mp3"}]
 
 
 class ControlsTests(unittest.TestCase):
@@ -260,6 +260,137 @@ class ControlsTests(unittest.TestCase):
         target.write_bytes(FRAME * 3)
         with self.assertRaisesRegex(RuntimeError, "Invalid audio size"):
             vault.validate_media(target, "audio", restored.sizes["audio"]["1"])
+
+    def test_changed_catalog_audio_is_downloaded_even_if_id_is_completed(self):
+        job = vault.build_jobs(SONGS[:1], self.args(), {})[0]
+        job.destination.parent.mkdir(parents=True)
+        job.destination.write_bytes(AUDIO)
+        history = vault.DownloadHistory(self.history)
+        history.record("1", "audio", job.destination, "audio/one-old.mp3")
+        history.save()
+        replacement = AUDIO + FRAME
+        result, stdout, _, request = self.invoke("--song-id", "1", responses=[Response(replacement)])
+        self.assertEqual(result, 0)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("Updated audio detected", stdout)
+        self.assertEqual(job.destination.read_bytes(), replacement)
+        self.assertEqual(vault.DownloadHistory(self.history).audio_sources["1"], "audio/one-v1.mp3")
+        result, _, _, request = self.invoke("--song-id", "1")
+        self.assertEqual(result, 0)
+        request.assert_not_called()
+
+    def test_failed_update_retains_old_source_and_is_retried_on_normal_run(self):
+        job = vault.build_jobs(SONGS[:1], self.args(), {})[0]
+        job.destination.parent.mkdir(parents=True)
+        job.destination.write_bytes(AUDIO)
+        history = vault.DownloadHistory(self.history)
+        history.record("1", "audio", job.destination, "audio/one-old.mp3")
+        history.save()
+        result, _, _, _ = self.invoke("--song-id", "1", responses=[Response(b"bad")])
+        self.assertEqual(result, 1)
+        self.assertEqual(job.destination.read_bytes(), AUDIO)
+        self.assertEqual(vault.DownloadHistory(self.history).audio_sources["1"], "audio/one-old.mp3")
+        replacement = AUDIO + FRAME
+        result, _, _, request = self.invoke("--song-id", "1", responses=[Response(replacement)])
+        self.assertEqual(result, 0)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(job.destination.read_bytes(), replacement)
+
+    def test_legacy_history_uses_previous_catalog_for_first_change_check(self):
+        self.output.mkdir()
+        vault.save_json(self.history, {"version": 1, "audio": ["1"], "image": []})
+        vault.save_json(self.output / "catalog.json", [{"id": "1", "song_path": "audio/old.mp3"}])
+        result, stdout, _, request = self.invoke("--song-id", "1", responses=[Response(AUDIO)])
+        self.assertEqual(result, 0)
+        self.assertIn("Earlier changes may not be detectable", stdout)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(vault.DownloadHistory(self.history).audio_sources["1"], "audio/one-v1.mp3")
+
+    def test_baseline_for_unselected_legacy_tracks_is_not_lost(self):
+        self.output.mkdir()
+        vault.save_json(self.history, {"version": 1, "audio": ["1", "2"], "image": []})
+        vault.save_json(self.output / "catalog.json", [{"id": "1", "song_path": "audio/one-v1.mp3"},
+                                                         {"id": "2", "song_path": "audio/old-two.mp3"}])
+        result, _, _, request = self.invoke("--song-id", "1")
+        self.assertEqual(result, 0)
+        request.assert_not_called()
+        self.assertEqual(vault.DownloadHistory(self.history).audio_sources["2"], "audio/old-two.mp3")
+        result, _, _, request = self.invoke("--song-id", "2", responses=[Response(AUDIO)])
+        self.assertEqual(result, 0)
+        self.assertEqual(request.call_count, 1)
+
+    def test_legacy_without_previous_catalog_warns_and_tracks_future_changes(self):
+        self.output.mkdir()
+        vault.save_json(self.history, {"version": 1, "audio": ["1"], "image": []})
+        result, stdout, _, request = self.invoke("--song-id", "1")
+        self.assertEqual(result, 0)
+        self.assertIn("Earlier changes may not be detectable", stdout)
+        request.assert_not_called()
+        self.assertEqual(vault.DownloadHistory(self.history).audio_sources["1"], "audio/one-v1.mp3")
+
+    def test_update_size_check_finds_moved_file_in_output_root(self):
+        self.output.mkdir()
+        job = vault.build_jobs(SONGS[:1], self.args(), {})[0]
+        moved = self.output / job.destination.name
+        moved.write_bytes(AUDIO)
+        history = vault.DownloadHistory(self.history)
+        history.completed["audio"].add("1")
+        history.audio_sources["1"] = SONGS[0]["song_path"]
+        history.save()
+        replacement = AUDIO + FRAME
+        with patch.object(vault, "remote_audio_size", return_value=len(replacement)) as head:
+            result, stdout, _, request = self.invoke("--song-id", "1", "--check-updates",
+                                                     responses=[Response(replacement)])
+        self.assertEqual(result, 0)
+        self.assertEqual(head.call_count, 1)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("Audio size changed", stdout)
+        self.assertEqual(moved.read_bytes(), AUDIO)
+        self.assertEqual(job.destination.read_bytes(), replacement)
+
+    def test_update_size_check_leaves_same_size_file_alone(self):
+        self.output.mkdir()
+        job = vault.build_jobs(SONGS[:1], self.args(), {})[0]
+        (self.output / job.destination.name).write_bytes(AUDIO)
+        history = vault.DownloadHistory(self.history)
+        history.completed["audio"].add("1")
+        history.audio_sources["1"] = SONGS[0]["song_path"]
+        history.save()
+        with patch.object(vault, "remote_audio_size", return_value=len(AUDIO)):
+            result, _, _, request = self.invoke("--song-id", "1", "--check-updates")
+        self.assertEqual(result, 0)
+        request.assert_not_called()
+
+    def test_update_size_check_reports_unknown_size_and_retains_history(self):
+        self.output.mkdir()
+        vault.save_json(self.history, {"version": 1, "audio": ["1"], "image": [],
+                                      "audio_sources": {"1": SONGS[0]["song_path"]}})
+        with patch.object(vault, "remote_audio_size") as head:
+            result, _, stderr, request = self.invoke("--song-id", "1", "--check-updates")
+        self.assertEqual(result, 1)
+        self.assertIn("no local or recorded size", stderr)
+        head.assert_not_called()
+        request.assert_not_called()
+        self.assertIn("1", vault.DownloadHistory(self.history).completed["audio"])
+
+    def test_update_check_errors_are_visible_without_forcing_download(self):
+        self.output.mkdir()
+        job = vault.build_jobs(SONGS[:1], self.args(), {})[0]
+        (self.output / job.destination.name).write_bytes(AUDIO)
+        vault.save_json(self.history, {"version": 1, "audio": ["1"], "image": [],
+                                      "audio_sources": {"1": SONGS[0]["song_path"]}})
+        with patch.object(vault, "remote_audio_size", side_effect=OSError("offline")):
+            result, _, stderr, request = self.invoke("--song-id", "1", "--check-updates")
+        self.assertEqual(result, 1)
+        self.assertIn("Cannot check ID 1: offline", stderr)
+        request.assert_not_called()
+
+    def test_remote_size_uses_head_without_reading_the_audio_body(self):
+        client = vault.Client(delay=0, retries=0)
+        response = Response(b"", Content_Length="12345")
+        with patch.object(client, "open", return_value=response) as request:
+            self.assertEqual(vault.remote_audio_size(client, "1"), 12345)
+        self.assertEqual(request.call_args.kwargs["method"], "HEAD")
 
     def test_interrupted_read_retains_partial_and_resumes(self):
         target = self.root / "track.mp3"
