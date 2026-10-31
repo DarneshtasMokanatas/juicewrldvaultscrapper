@@ -335,6 +335,7 @@ class ControlsTests(unittest.TestCase):
         moved.write_bytes(AUDIO)
         history = vault.DownloadHistory(self.history)
         history.completed["audio"].add("1")
+        history.filenames["1"] = job.destination.stem
         history.audio_sources["1"] = SONGS[0]["song_path"]
         history.save()
         replacement = AUDIO + FRAME
@@ -354,6 +355,7 @@ class ControlsTests(unittest.TestCase):
         (self.output / job.destination.name).write_bytes(AUDIO)
         history = vault.DownloadHistory(self.history)
         history.completed["audio"].add("1")
+        history.filenames["1"] = job.destination.stem
         history.audio_sources["1"] = SONGS[0]["song_path"]
         history.save()
         with patch.object(vault, "remote_audio_size", return_value=len(AUDIO)):
@@ -378,7 +380,8 @@ class ControlsTests(unittest.TestCase):
         job = vault.build_jobs(SONGS[:1], self.args(), {})[0]
         (self.output / job.destination.name).write_bytes(AUDIO)
         vault.save_json(self.history, {"version": 1, "audio": ["1"], "image": [],
-                                      "audio_sources": {"1": SONGS[0]["song_path"]}})
+                                      "audio_sources": {"1": SONGS[0]["song_path"]},
+                                      "filenames": {"1": job.destination.stem}})
         with patch.object(vault, "remote_audio_size", side_effect=OSError("offline")):
             result, _, stderr, request = self.invoke("--song-id", "1", "--check-updates")
         self.assertEqual(result, 1)

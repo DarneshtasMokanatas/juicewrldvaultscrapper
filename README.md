@@ -6,8 +6,9 @@ It saves catalog metadata, retries temporary network failures, and skips files
 it has already downloaded. No account, API key, or additional Python packages
 are required.
 
-Version **1.5.0** saves MP3 and RIFF/WAV audio with their correct extensions,
-without converting audio or rewriting the files' embedded metadata.
+Version **1.6.0** uses title-and-artist filenames without appended track IDs.
+It saves MP3, RIFF/WAV, FLAC, Ogg/Opus, and MP4/M4A in their original formats
+and preserves their embedded metadata.
 
 This is an unofficial tool. It downloads public catalog tracks, rather than
 mirroring the entire website or discovering hidden files. The site's endpoints
@@ -50,8 +51,9 @@ To download the full public catalog, remove `--limit 1`:
 py -3 .\download_juicewrldvault.py --artwork
 ```
 
-The catalog can contain formats other than MP3 and WAV. This version reports
-those tracks as unsupported rather than saving them with a misleading extension.
+The script supports MP3, RIFF/WAV, FLAC, Ogg/Opus, and MP4/M4A. If the site
+supplies another format, it is reported as unsupported rather than saved with
+a misleading extension.
 
 The default output folder is `Downloads/juicewrldvault` under your home folder.
 The script prints the absolute location at startup. A large catalog can take
@@ -80,9 +82,13 @@ py -3 .\download_juicewrldvault.py --search "night" --type raw --limit 5
 
 Repeat `--song-id` to choose multiple IDs. Exact IDs, text, and type filters
 intersect; `--limit` applies after filtering in catalog order. Unknown explicit
-IDs cause an error before any media downloads. Filenames use the catalog's title,
-artist, and a stable track ID; characters that a filesystem cannot use are
-replaced. The full catalog metadata remains in `catalog.json`. Audio bytes and
+IDs cause an error before any media downloads. Filenames use the catalog's title
+and artist, such as `Song - Artist.wav`; duplicate names receive `(2)`, `(3)`,
+and so on, rather than a track ID. Characters a filesystem cannot use are
+replaced. The ID and the assigned filename stay in history so later runs can
+recognize the song and keep duplicate numbering stable. Assigned filenames do
+not automatically change when a catalog title changes. The full catalog metadata
+remains in `catalog.json`. Audio bytes and
 embedded tags are left exactly as supplied by the server, so the original tags
 may differ from the catalog title or artist.
 
@@ -142,7 +148,7 @@ py -3 .\download_juicewrldvault.py --output "D:\Music\Juice Vault" --check-updat
 
 This uses one HTTP HEAD request per completed selected track with a known size;
 it does not download audio merely to compare it. It checks files with original
-ID suffixes in the output folder and its `songs/` subfolder, as well as sizes
+known filenames or legacy ID suffixes in the output folder and its `songs/` subfolder, as well as sizes
 stored in history. It takes at least about 6½ minutes for 3,900 tracks with the
 default 0.1-second request spacing, plus network and download time. Missing
 sizes or failed checks are reported, and the exit code is `1` if any could not
@@ -214,26 +220,27 @@ juicewrldvault/
   catalog.json       Full track metadata returned by the site
   failures.json      Unresolved failed, queued, or interrupted files
   .download.lock     Output-folder lock (leave this file in place)
-  songs/            MP3 or WAV files with track IDs to distinguish versions
+  songs/            Audio files named with title and artist
   artwork/          Cover images, when --artwork is used
 ```
 
 Press **Ctrl+C** to stop. Run the same command with the same output folder to
 continue. Completed IDs are saved to a persistent history file outside the media
 folder, so moving or renaming downloaded music does not cause it to download
-again. Existing files with their original ID suffixes are checked and valid ones
-are recorded automatically. Interrupted files remain as
+again. Existing files matched by saved filenames or legacy ID suffixes are
+checked and valid ones are recorded automatically. Interrupted files remain as
 `.part` files with `.part.json` metadata. They resume when the server provides
 the required range and validation headers; otherwise they restart safely.
 Keep these files if you plan to resume.
 
-Audio checks cover nonempty content, HTTP sizes when supplied, MP3 frame
-boundaries, and standard RIFF/WAV chunk boundaries. MP3 support includes
-MPEG-1/2/2.5, variable bitrates, ID3 tags, and APE tags. Free-format MP3
-bitrates and RF64 WAV files are unsupported. The detected bytes determine the
-extension of each completed download; neither format is transcoded. Previously
-downloaded WAV audio mistakenly named `.mp3` can be recognized when scanning
-history, but is not renamed automatically. Artwork uses basic format
+Audio checks cover nonempty content, HTTP sizes when supplied, MP3 frames,
+RIFF/WAV chunks, FLAC metadata, Ogg/Opus pages, and MP4/M4A container boxes.
+MP3 support includes MPEG-1/2/2.5, variable bitrates, ID3 tags, and APE tags.
+Free-format MP3 bitrates and RF64 WAV files are unsupported. The detected bytes
+determine the format; the catalog extension distinguishes MP4 from M4A when
+both use the same container. Audio is not transcoded. Previously downloaded WAV
+audio mistakenly named `.mp3` can be recognized when scanning history, but is
+not renamed automatically. Artwork uses basic format
 signatures/end markers or container sizes. Newly recorded file sizes are also
 kept in history to detect changed local files. Invalid local copies lose their
 completion record and can be fetched again. Legacy history files remain readable.
@@ -246,14 +253,18 @@ write to either resource while the first is running, even with a different outpu
 or history setting. Locks release automatically after exit or a crash. Do not
 delete lock files while a downloader is running; close the other process first.
 
-Before moving music downloaded by an older version, record the existing files
-using the saved `catalog.json` and the original filenames:
+Before moving music, record existing files using the saved `catalog.json` and
+the original filenames:
 
 ```powershell
 py -3 .\download_juicewrldvault.py --output "D:\Music\Juice Vault" --sync-history
 ```
 
 This operation is offline and requires at least one matching completed song.
+If filename mappings are missing, unambiguous title-and-artist names and older
+ID-suffixed names can be matched. Duplicate titles without a saved mapping are
+ambiguous and are not guessed. Keep and back up the history file: it contains
+the song IDs and filename mappings needed for reliable matching after files move.
 Keep the history file after moving the music. Use the same `--history PATH` for
 future runs if you choose a custom location. `--sync-history` cannot be combined
 with selection filters. The history path must be separate from catalog,
@@ -282,7 +293,7 @@ unfiltered retry), `2` for invalid arguments, and `130` for Ctrl+C.
 - **Cannot lock output/history:** Close the other downloader that uses that
   folder or history. A leftover lock file itself does not block a new run.
 - **Invalid/unsupported audio or artwork:** The response may be incomplete, an
-  error page, or a format other than MP3 or RIFF/WAV. Review `failures.json` and try
+  error page, or a format the script does not support. Review `failures.json` and try
   `--retry-failed` later; use `--redownload ID` for a fresh transfer.
 
 ## Offline tests

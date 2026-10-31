@@ -14,7 +14,7 @@ Examples:
 
 Download history stays in ~/.juicewrldvault/downloaded_songs.json, independently
 of the media folder. Run --sync-history before moving existing songs away.
-MP3 and WAV are saved in their original formats with their embedded tags intact.
+Audio is saved in its original supported format with embedded tags intact.
 
 Only public catalog/download endpoints are used. Hidden files and files requiring
 authentication are outside the scope of this script.
@@ -42,8 +42,9 @@ from urllib.request import Request, urlopen
 
 BASE = "https://juicewrldvault.com"
 MEDIA = "https://media.juicewrldvault.com"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 TRANSIENT = {408, 425, 429, 500, 502, 503, 504}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".opus", ".m4a", ".mp4"}
 
 
 class DownloadCancelled(Exception):
@@ -173,6 +174,44 @@ def save_json(path, data):
 
 def song_identifier(song_id):
     return safe_name(song_id, 35) + "-" + hashlib.sha256(song_id.encode()).hexdigest()[:8]
+
+
+def song_base_name(song):
+    return safe_name(f"{song.get('title') or 'Untitled'} - {song.get('author') or 'Unknown'}")
+
+
+def allocate_filenames(songs, existing=None, output=None):
+    """Keep stable title/artist names, numbering collisions without exposing IDs."""
+    names = dict(existing or {})
+    used = {name.casefold() for name in names.values()}
+    occupied = set()
+    if output is not None:
+        for folder in (output, output / "songs", output / "artwork"):
+            if not folder.is_dir():
+                continue
+            for path in folder.iterdir():
+                if not path.is_file():
+                    continue
+                name = path.name
+                if name.lower().endswith(".part.json"):
+                    name = name[:-10]
+                elif name.lower().endswith(".part"):
+                    name = name[:-5]
+                p = Path(name)
+                if p.suffix.lower() in AUDIO_EXTENSIONS | {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"}:
+                    occupied.add(p.stem.casefold())
+    for song in sorted(songs, key=lambda item: str(item["id"])):
+        song_id = str(song["id"])
+        if song_id in names:
+            continue
+        base = song_base_name(song)
+        stem, number = base, 2
+        while stem.casefold() in used or stem.casefold() in occupied:
+            stem = f"{base} ({number})"
+            number += 1
+        names[song_id] = stem
+        used.add(stem.casefold())
+    return names
 
 
 class RunLock:
@@ -321,27 +360,105 @@ def validate_wav(stream, size):
         raise RuntimeError("WAV is missing a format or audio data chunk")
 
 
-def audio_format(path):
+def validate_flac(stream, size):
+    stream.seek(0)
+    if stream.read(4) != b"fLaC":
+        raise RuntimeError("Invalid FLAC header")
+    first, last, position = True, False, 4
+    while not last:
+        stream.seek(position)
+        header = stream.read(4)
+        if len(header) != 4:
+            raise RuntimeError("Truncated FLAC metadata")
+        last = bool(header[0] & 0x80)
+        block_type, length = header[0] & 0x7f, int.from_bytes(header[1:4], "big")
+        if first and (block_type != 0 or length != 34):
+            raise RuntimeError("Invalid FLAC STREAMINFO")
+        first = False
+        position += 4 + length
+        if position > size:
+            raise RuntimeError("Truncated FLAC metadata")
+    if position >= size:
+        raise RuntimeError("FLAC contains no audio data")
+
+
+def validate_opus(stream, size):
+    position, pages = 0, 0
+    while position < size:
+        stream.seek(position)
+        header = stream.read(27)
+        if len(header) != 27 or header[:4] != b"OggS" or header[4] != 0:
+            raise RuntimeError("Invalid or truncated Ogg page")
+        lacing = stream.read(header[26])
+        if len(lacing) != header[26]:
+            raise RuntimeError("Truncated Ogg segment table")
+        length = sum(lacing)
+        if position + 27 + len(lacing) + length > size:
+            raise RuntimeError("Truncated Ogg page")
+        if pages == 0 and (length < 8 or stream.read(8) != b"OpusHead"):
+            raise RuntimeError("Ogg stream is not Opus audio")
+        position += 27 + len(lacing) + length
+        pages += 1
+    if not pages:
+        raise RuntimeError("Empty Ogg stream")
+
+
+def validate_mp4(stream, size):
+    position, boxes = 0, set()
+    while position < size:
+        stream.seek(position)
+        header = stream.read(8)
+        if len(header) != 8:
+            raise RuntimeError("Truncated MP4 box header")
+        length = int.from_bytes(header[:4], "big")
+        box, minimum = header[4:8], 8
+        if length == 1:
+            extended = stream.read(8)
+            if len(extended) != 8:
+                raise RuntimeError("Truncated MP4 extended box header")
+            length, minimum = int.from_bytes(extended, "big"), 16
+        elif length == 0:
+            length = size - position
+        if length < minimum or position + length > size:
+            raise RuntimeError("Invalid or truncated MP4 box")
+        if box == b"ftyp" and length < minimum + 8:
+            raise RuntimeError("Invalid MP4 file type box")
+        if box == b"mdat" and length == minimum:
+            raise RuntimeError("Empty MP4 media box")
+        boxes.add(box)
+        position += length
+    if not {b"ftyp", b"moov", b"mdat"}.issubset(boxes):
+        raise RuntimeError("MP4 is missing a required container box")
+
+
+def audio_format(path, hint=None):
     """Determine the real format from bytes, including legacy misnamed files."""
     with path.open("rb") as stream:
         header = stream.read(12)
     if header.startswith(b"RIFF"):
         return ".wav"
+    if header.startswith(b"fLaC"):
+        return ".flac"
+    if header.startswith(b"OggS"):
+        return ".opus"  # Validation confirms the Ogg stream is Opus.
+    if header[4:8] == b"ftyp":
+        if hint in {".m4a", ".mp4"}:
+            return hint
+        return ".m4a" if header[8:12] in {b"M4A ", b"M4B "} else ".mp4"
     if header.startswith(b"ID3") or len(header) >= 2 and header[0] == 0xff and header[1] & 0xe0 == 0xe0:
         return ".mp3"
-    raise RuntimeError("Unsupported audio format; this version supports MP3 and RIFF/WAV")
+    raise RuntimeError("Unsupported audio format; expected MP3, WAV, FLAC, Opus or MP4/M4A")
 
 
-def validate_media(path, kind, expected_size=None):
+def validate_media(path, kind, expected_size=None, format_hint=None):
     size = path.stat().st_size
     if not size or expected_size is not None and size != expected_size:
         raise RuntimeError(f"Invalid {kind} size: {size}, expected {expected_size or 'nonempty'}")
     with path.open("rb") as stream:
         if kind == "audio":
-            if audio_format(path) == ".wav":
-                validate_wav(stream, size)
-            else:
-                validate_mp3(stream, size)
+            fmt = audio_format(path, format_hint or path.suffix.lower())
+            {".mp3": validate_mp3, ".wav": validate_wav, ".flac": validate_flac,
+             ".opus": validate_opus, ".m4a": validate_mp4, ".mp4": validate_mp4}[fmt](stream, size)
         else:
             header = stream.read(64)
             stream.seek(max(0, size - 12))
@@ -366,6 +483,7 @@ class DownloadHistory:
         self.sizes = {"audio": {}, "image": {}}
         # The catalog path is a change signal, not a guaranteed content hash.
         self.audio_sources = {}
+        self.filenames = {}
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -390,6 +508,17 @@ class DownloadHistory:
                         or not isinstance(value, str) or not value for key, value in sources.items())):
                     raise ValueError("invalid audio source records")
                 self.audio_sources = sources
+                names = data.get("filenames", {})
+                if (not isinstance(names, dict) or any(not isinstance(key, str)
+                        or not isinstance(value, str) or not value or value in {".", ".."}
+                        or value != value.strip(" .") or len(value.encode("utf-8")) > 220
+                        or value.split(".")[0].upper() in {
+                            "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(10)),
+                            *(f"LPT{i}" for i in range(10))}
+                        or re.search(r'[<>:"/\\|?*\x00-\x1f]', value) for key, value in names.items())
+                        or len({name.casefold() for name in names.values()}) != len(names)):
+                    raise ValueError("invalid or conflicting filename records")
+                self.filenames = names
             except (ValueError, KeyError, TypeError) as error:
                 raise RuntimeError(f"Cannot read download history '{path}': {error}. "
                                    "Restore a valid copy before continuing.") from error
@@ -397,6 +526,7 @@ class DownloadHistory:
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         save_json(self.path, {"version": 1, "sizes": self.sizes, "audio_sources": self.audio_sources,
+                             "filenames": self.filenames,
                              **{kind: sorted(ids) for kind, ids in self.completed.items()}})
 
     def record(self, song_id, kind, path, source=None):
@@ -404,6 +534,10 @@ class DownloadHistory:
         self.completed[kind].add(song_id)
         if kind == "audio" and source:
             self.audio_sources[song_id] = source
+        if (song_id not in self.filenames
+                and not path.stem.endswith(f" [{song_identifier(song_id)}]")
+                and path.stem.casefold() not in {name.casefold() for name in self.filenames.values()}):
+            self.filenames[song_id] = path.stem
 
     def forget(self, song_id, kind):
         self.completed[kind].discard(song_id)
@@ -423,13 +557,19 @@ class DownloadHistory:
                 count += 1
         return count
 
-    def scan(self, songs, output):
+    def scan(self, songs, output, allow_untracked_names=False, pending_failures=None):
         # Match stable suffixes even if the catalog's title/author has changed.
         identifiers = {song_identifier(str(song["id"])) + "]": str(song["id"])
                        for song in songs}
+        mapped_names = {stem.casefold(): song_id for song_id, stem in self.filenames.items()}
+        grouped = {}
+        if allow_untracked_names:
+            for song in songs:
+                grouped.setdefault(song_base_name(song).casefold(), []).append(str(song["id"]))
+        unambiguous = {stem: ids[0] for stem, ids in grouped.items() if len(ids) == 1}
         found = {"audio": 0, "image": 0}
         for kind, directory, extensions in (
-                ("audio", "songs", {".mp3", ".wav"}),
+                ("audio", "songs", AUDIO_EXTENSIONS),
                 ("image", "artwork", {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"})):
             folder = output / directory
             if not folder.exists():
@@ -439,6 +579,13 @@ class DownloadHistory:
                 if path.suffix.lower() not in extensions or not path.is_file():
                     continue
                 song_id = identifiers.get(path.stem.rpartition(" [")[2])
+                if song_id is None:
+                    match = mapped_names.get(path.stem.casefold())
+                    if match is not None and (allow_untracked_names or match in self.completed[kind]
+                                              or (match, kind) in (pending_failures or {})):
+                        song_id = match
+                    elif allow_untracked_names:
+                        song_id = unambiguous.get(path.stem.casefold())
                 if song_id is not None:
                     try:
                         validate_media(path, kind, self.sizes[kind].get(song_id))
@@ -448,6 +595,10 @@ class DownloadHistory:
                     else:
                         valid_ids.add(song_id)
                         self.sizes[kind][song_id] = path.stat().st_size
+                        if allow_untracked_names and not identifiers.get(path.stem.rpartition(" [")[2]):
+                            if song_id not in self.filenames and path.stem.casefold() not in mapped_names:
+                                self.filenames[song_id] = path.stem
+                                mapped_names[path.stem.casefold()] = song_id
                         found[kind] += 1
             for song_id in invalid_ids - valid_ids:
                 self.forget(song_id, kind)
@@ -539,18 +690,19 @@ def download(client, url, destination, kind, force=False, progress=None, fresh=F
                 if not size or total is not None and size != total:
                     raise ConnectionError(f"Incomplete file: {size} of {total} bytes")
             try:
-                validate_media(partial, kind, total)
+                validate_media(partial, kind, total, destination.suffix.lower() if kind == "audio" else None)
             except RuntimeError:
                 # Invalid complete payloads cannot be repaired by appending bytes.
                 partial.unlink(missing_ok=True)
                 state_path.unlink(missing_ok=True)
                 raise
-            actual = destination.with_suffix(audio_format(partial)) if kind == "audio" else destination
+            actual = destination.with_suffix(audio_format(partial, destination.suffix.lower())) if kind == "audio" else destination
             if actual != destination and actual.is_file() and not force:
                 try:
                     validate_media(actual, kind)
-                except RuntimeError:
-                    pass
+                except RuntimeError as error:
+                    raise RuntimeError(f"Existing destination '{actual}' is invalid; "
+                                       "it was not overwritten. Inspect it before retrying.") from error
                 else:
                     partial.unlink(missing_ok=True)
                     state_path.unlink(missing_ok=True)
@@ -610,7 +762,7 @@ def load_failures(path, required=False):
             if kind is None:
                 # Read reports from v1.0/v1.2 without trusting their URLs or paths.
                 suffix = Path(str(record.get("file", ""))).suffix.lower()
-                kind = "audio" if suffix in {".mp3", ".wav"} else "image" if suffix in {
+                kind = "audio" if suffix in AUDIO_EXTENSIONS else "image" if suffix in {
                     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"} else None
             if kind not in {"audio", "image"}:
                 raise ValueError("invalid failure kind")
@@ -647,18 +799,18 @@ def select_songs(songs, args, failures):
     return selected if args.limit is None else selected[:args.limit]
 
 
-def build_jobs(songs, args, failures):
+def build_jobs(songs, args, failures, filenames=None):
     jobs = []
+    filenames = filenames if filenames is not None else allocate_filenames(songs)
     for song in songs:
         song_id = str(song["id"])
-        stem = safe_name(f"{song.get('title', 'Untitled')} - {song.get('author', 'Unknown')}")
-        stem += f" [{song_identifier(song_id)}]"
+        stem = filenames[song_id]
         force = song_id in (args.redownload or []) or args.retry_failed
         fresh = song_id in (args.redownload or [])
         if not args.retry_failed or (song_id, "audio") in failures:
             source = song.get("song_path") if isinstance(song.get("song_path"), str) else ""
             extension = Path(urlsplit(source).path).suffix.lower()
-            if extension not in {".mp3", ".wav"}:
+            if extension not in AUDIO_EXTENSIONS:
                 extension = ".mp3"  # The response bytes determine the final extension.
             jobs.append(Job(song_id, BASE + "/api/download-song?" + urlencode({"id": song_id}),
                             args.output / "songs" / (stem + extension), "audio", force, fresh, source))
@@ -797,18 +949,47 @@ def previous_catalog_sources(path):
         return {}
 
 
+def recover_failure_filenames(songs, failures, history, output):
+    """Recover names for pending work without trusting arbitrary stored paths."""
+    by_id = {str(song["id"]): song for song in songs}
+    used = {name.casefold() for name in history.filenames.values()}
+    for (song_id, kind), item in failures.items():
+        if song_id in history.filenames or song_id not in by_id:
+            continue
+        filename = item.get("file")
+        if not isinstance(filename, str):
+            continue
+        path = Path(filename)
+        folder = output / ("songs" if kind == "audio" else "artwork")
+        if path.parent.resolve() != folder.resolve():
+            continue
+        extensions = AUDIO_EXTENSIONS if kind == "audio" else {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"}
+        if path.suffix.lower() not in extensions:
+            continue
+        base = song_base_name(by_id[song_id])
+        stem = path.stem
+        suffix = stem[len(base):] if stem.startswith(base) else "?"
+        if (suffix and not (re.fullmatch(r" \(\d+\)", suffix) and int(suffix[2:-1]) >= 2)) or stem.casefold() in used:
+            continue
+        history.filenames[song_id] = stem
+        used.add(stem.casefold())
+
+
 def local_audio_sizes(songs, history, output):
     """Find known sizes without reading audio bytes or following nested folders."""
     identifiers = {song_identifier(str(song["id"])) + "]": str(song["id"]) for song in songs}
+    mapped = {name.casefold(): song_id for song_id, name in history.filenames.items()}
     sizes = {song_id: {size} for song_id, size in history.sizes["audio"].items()
              if song_id in history.completed["audio"]}
     for folder in (output, output / "songs"):
         if not folder.is_dir():
             continue
         for path in folder.iterdir():
-            if path.suffix.lower() not in {".mp3", ".wav"} or not path.is_file():
+            if path.suffix.lower() not in AUDIO_EXTENSIONS or not path.is_file():
                 continue
             song_id = identifiers.get(path.stem.rpartition(" [")[2])
+            if song_id is None:
+                song_id = mapped.get(path.stem.casefold())
             if song_id in history.completed["audio"]:
                 size = path.stat().st_size
                 if size:
@@ -894,10 +1075,10 @@ def run(args):
                 or any(not isinstance(song, dict) or song.get("id") is None for song in songs)):
             raise RuntimeError("Invalid local catalog.json; refresh it with --list-only.")
         history = DownloadHistory(args.history)
-        found = history.scan(songs, args.output)
+        found = history.scan(songs, args.output, allow_untracked_names=True)
         if not found["audio"]:
             raise RuntimeError("No valid completed songs matched the local catalog. Check --output "
-                               "and keep the original ID suffixes until history is recorded.")
+                               "and keep original filenames until history is recorded.")
         history.seed_sources(songs, {})
         history.save()
         print(f"Recorded {found['audio']} songs and {found['image']} artwork files. History: {args.history}")
@@ -913,6 +1094,8 @@ def run(args):
     songs = catalog(client)
     selected = select_songs(songs, args, failures)
     if history:
+        recover_failure_filenames(songs, failures, history, args.output)
+        history.filenames = allocate_filenames(songs, history.filenames, args.output)
         seeded = history.seed_sources(songs, previous)
         if seeded:
             print(f"Initialized update tracking for {seeded} existing tracks from available catalog data. "
@@ -929,12 +1112,12 @@ def run(args):
     if not selected:
         print("No tracks matched the selected filters.")
         return 1 if args.retry_failed and failures else 0
-    history.scan(songs, args.output)
+    history.scan(songs, args.output, pending_failures=failures)
     history.seed_sources(songs, previous)
     size_changes, unchecked = (check_remote_sizes(client, selected, history, args.output, args.workers)
                                if args.check_updates else (set(), 0))
     jobs, skipped = [], {"audio": 0, "image": 0}
-    for job in build_jobs(selected, args, failures):
+    for job in build_jobs(selected, args, failures, history.filenames):
         old_source = history.audio_sources.get(job.song_id) if job.kind == "audio" else None
         if old_source and job.source and old_source != job.source:
             print(f"Updated audio detected for ID {job.song_id}; downloading the new version.", flush=True)

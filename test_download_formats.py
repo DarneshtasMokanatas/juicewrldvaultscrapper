@@ -67,12 +67,12 @@ class FormatTests(unittest.TestCase):
         self.assertFalse(guessed_wav.exists())
         self.assertEqual(vault.validate_media(result.path, "audio"), len(data))
 
-    def test_catalog_title_author_and_id_determine_filename_without_altering_metadata(self):
+    def test_catalog_title_and_author_determine_filename_without_altering_metadata(self):
         song = {"id": "3789", "title": "DENIAL </3 (demo) [RAW]", "author": "Juice WRLD",
                 "song_path": "uploads/denial.wav"}
         args = argparse.Namespace(output=self.root, redownload=None, retry_failed=False, artwork=False)
         job = vault.build_jobs([song], args, {})[0]
-        self.assertEqual(job.destination.name, "DENIAL __3 (demo) [RAW] - Juice WRLD [3789-275a8cd3].wav")
+        self.assertEqual(job.destination.name, "DENIAL __3 (demo) [RAW] - Juice WRLD.wav")
         self.assertEqual(song["title"], "DENIAL </3 (demo) [RAW]")
         data = wav_with_tags()
         result = vault.download(FakeClient(Response(data, content_type="audio/wav")), job.url,
@@ -125,9 +125,45 @@ class FormatTests(unittest.TestCase):
     def test_unrecognized_audio_is_not_published_with_an_mp3_extension(self):
         target = self.root / "song.mp3"
         with self.assertRaisesRegex(RuntimeError, "Unsupported audio format"):
-            vault.download(FakeClient(Response(b"fLaC" + bytes(64), content_type="audio/flac")),
+            vault.download(FakeClient(Response(b"unknown" + bytes(64), content_type="application/octet-stream")),
                            self.url, target, "audio")
         self.assertFalse(target.exists())
+
+    def test_flac_and_opus_are_saved_with_their_original_format_and_bytes(self):
+        def ogg_page(payload, number):
+            return (b"OggS" + b"\0" + (b"\x02" if number == 0 else b"\x04")
+                    + bytes(8) + (1).to_bytes(4, "little") + number.to_bytes(4, "little")
+                    + bytes(4) + b"\x01" + bytes([len(payload)]) + payload)
+        flac = b"fLaC" + b"\x80\x00\x00\x22" + bytes(34) + b"\xff\xf8audio"
+        opus = ogg_page(b"OpusHead" + bytes(11), 0) + ogg_page(b"OpusTags Original title", 1)
+        for ext, data in ((".flac", flac), (".opus", opus)):
+            with self.subTest(extension=ext):
+                guessed = self.root / f"song-{ext[1:]}.mp3"
+                result = vault.download(FakeClient(Response(data, content_type="application/octet-stream")),
+                                        self.url, guessed, "audio")
+                self.assertEqual(result.path.suffix, ext)
+                self.assertEqual(result.path.read_bytes(), data)
+                self.assertFalse(guessed.exists())
+
+    def test_m4a_and_mp4_preserve_catalog_extension_and_container_bytes(self):
+        def box(kind, payload):
+            return struct.pack(">I", len(payload) + 8) + kind + payload
+        data = box(b"ftyp", b"isom" + bytes(4) + b"mp42") + box(b"moov", b"tags") + box(b"mdat", b"audio")
+        for ext in (".m4a", ".mp4"):
+            with self.subTest(extension=ext):
+                target = self.root / f"song{ext}"
+                result = vault.download(FakeClient(Response(data, content_type="audio/mp4")),
+                                        self.url, target, "audio")
+                self.assertEqual(result.path, target)
+                self.assertEqual(target.read_bytes(), data)
+
+    def test_truncated_extra_formats_are_rejected(self):
+        cases = (b"fLaC" + b"\x80\x00\x00\x22" + bytes(10),
+                 b"OggS" + bytes(10),
+                 struct.pack(">I", 100) + b"ftyp" + b"isom" + bytes(4))
+        for n, data in enumerate(cases):
+            with self.subTest(n=n), self.assertRaises(RuntimeError):
+                vault.download(FakeClient(Response(data)), self.url, self.root / f"song-{n}.mp3", "audio")
 
     def test_conflicting_existing_destination_is_not_overwritten_when_not_forced(self):
         guessed = self.root / "song.mp3"
@@ -139,6 +175,15 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(result, "skipped")
         self.assertEqual(result.path, actual)
         self.assertEqual(actual.read_bytes(), old)
+
+    def test_invalid_conflicting_destination_is_not_overwritten(self):
+        guessed = self.root / "song.mp3"
+        actual = self.root / "song.wav"
+        actual.write_bytes(b"existing but invalid")
+        with self.assertRaisesRegex(RuntimeError, "not overwritten"):
+            vault.download(FakeClient(Response(wav_with_tags(), content_type="audio/wav")),
+                           self.url, guessed, "audio")
+        self.assertEqual(actual.read_bytes(), b"existing but invalid")
 
     def test_download_result_records_detected_destination_in_history(self):
         song = {"id": "3789", "title": "Song", "author": "Artist", "song_path": "audio/song.mp3"}
