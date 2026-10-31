@@ -14,6 +14,7 @@ Examples:
 
 Download history stays in ~/.juicewrldvault/downloaded_songs.json, independently
 of the media folder. Run --sync-history before moving existing songs away.
+MP3 and WAV are saved in their original formats with their embedded tags intact.
 
 Only public catalog/download endpoints are used. Hidden files and files requiring
 authentication are outside the scope of this script.
@@ -41,7 +42,7 @@ from urllib.request import Request, urlopen
 
 BASE = "https://juicewrldvault.com"
 MEDIA = "https://media.juicewrldvault.com"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 TRANSIENT = {408, 425, 429, 500, 502, 503, 504}
 
 
@@ -260,6 +261,10 @@ def validate_mp3(stream, size):
                 remaining -= len(block)
             break
         if len(header) != 4:
+            # Some files from the catalog carry an empty JSON suffix after audio.
+            # Preserve the source bytes; this is not an incomplete MPEG frame.
+            if frames >= 2 and header == b"{}":
+                break
             raise RuntimeError("Truncated MP3 frame header")
         bits = int.from_bytes(header, "big")
         version, layer = (bits >> 19) & 3, (bits >> 17) & 3
@@ -280,13 +285,63 @@ def validate_mp3(stream, size):
         raise RuntimeError("Audio must contain at least two complete MP3 frames")
 
 
+def validate_wav(stream, size):
+    """Validate standard RIFF/WAVE chunk boundaries without rewriting tags."""
+    stream.seek(0)
+    header = stream.read(12)
+    if len(header) != 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        raise RuntimeError("Invalid or unsupported WAV header")
+    end = int.from_bytes(header[4:8], "little") + 8
+    if end < 12 or end > size:
+        raise RuntimeError("Truncated WAV container")
+    position, has_format, has_audio = 12, False, False
+    while position < end:
+        if end - position < 8:
+            raise RuntimeError("Truncated WAV chunk header")
+        stream.seek(position)
+        chunk = stream.read(8)
+        chunk_size = int.from_bytes(chunk[4:8], "little")
+        chunk_end = position + 8 + chunk_size
+        if chunk_end > end:
+            raise RuntimeError("Truncated WAV chunk")
+        if chunk[:4] == b"fmt ":
+            if chunk_size < 16:
+                raise RuntimeError("Invalid WAV format chunk")
+            fmt = stream.read(16)
+            if (not int.from_bytes(fmt[:2], "little") or not int.from_bytes(fmt[2:4], "little")
+                    or not int.from_bytes(fmt[4:8], "little") or not int.from_bytes(fmt[12:14], "little")):
+                raise RuntimeError("Invalid WAV format details")
+            has_format = True
+        elif chunk[:4] == b"data" and chunk_size:
+            has_audio = True
+        position = chunk_end + (chunk_size & 1)
+        if position > end:
+            raise RuntimeError("Truncated WAV chunk padding")
+    if not has_format or not has_audio:
+        raise RuntimeError("WAV is missing a format or audio data chunk")
+
+
+def audio_format(path):
+    """Determine the real format from bytes, including legacy misnamed files."""
+    with path.open("rb") as stream:
+        header = stream.read(12)
+    if header.startswith(b"RIFF"):
+        return ".wav"
+    if header.startswith(b"ID3") or len(header) >= 2 and header[0] == 0xff and header[1] & 0xe0 == 0xe0:
+        return ".mp3"
+    raise RuntimeError("Unsupported audio format; this version supports MP3 and RIFF/WAV")
+
+
 def validate_media(path, kind, expected_size=None):
     size = path.stat().st_size
     if not size or expected_size is not None and size != expected_size:
         raise RuntimeError(f"Invalid {kind} size: {size}, expected {expected_size or 'nonempty'}")
     with path.open("rb") as stream:
         if kind == "audio":
-            validate_mp3(stream, size)
+            if audio_format(path) == ".wav":
+                validate_wav(stream, size)
+            else:
+                validate_mp3(stream, size)
         else:
             header = stream.read(64)
             stream.seek(max(0, size - 12))
@@ -374,7 +429,7 @@ class DownloadHistory:
                        for song in songs}
         found = {"audio": 0, "image": 0}
         for kind, directory, extensions in (
-                ("audio", "songs", {".mp3"}),
+                ("audio", "songs", {".mp3", ".wav"}),
                 ("image", "artwork", {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"})):
             folder = output / directory
             if not folder.exists():
@@ -400,6 +455,15 @@ class DownloadHistory:
         return found
 
 
+class DownloadResult(str):
+    """Status plus actual path, which can differ from the catalog's extension."""
+
+    def __new__(cls, status, path):
+        result = super().__new__(cls, status)
+        result.path = path
+        return result
+
+
 def download(client, url, destination, kind, force=False, progress=None, fresh=False):
     """Resume partial files with Range and If-Range; publish only complete files."""
     client.check_stopped()
@@ -409,7 +473,7 @@ def download(client, url, destination, kind, force=False, progress=None, fresh=F
         except RuntimeError:
             pass
         else:
-            return "skipped"
+            return DownloadResult("skipped", destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + ".part")
     state_path = partial.with_name(partial.name + ".json")
@@ -481,9 +545,19 @@ def download(client, url, destination, kind, force=False, progress=None, fresh=F
                 partial.unlink(missing_ok=True)
                 state_path.unlink(missing_ok=True)
                 raise
-            os.replace(partial, destination)
+            actual = destination.with_suffix(audio_format(partial)) if kind == "audio" else destination
+            if actual != destination and actual.is_file() and not force:
+                try:
+                    validate_media(actual, kind)
+                except RuntimeError:
+                    pass
+                else:
+                    partial.unlink(missing_ok=True)
+                    state_path.unlink(missing_ok=True)
+                    return DownloadResult("skipped", actual)
+            os.replace(partial, actual)
             state_path.unlink(missing_ok=True)
-            return "downloaded"
+            return DownloadResult("downloaded", actual)
         except (HTTPError, URLError, TimeoutError, ConnectionError,
                 http.client.IncompleteRead) as error:
             # A complete partial file may produce 416. Restart to verify it.
@@ -536,7 +610,7 @@ def load_failures(path, required=False):
             if kind is None:
                 # Read reports from v1.0/v1.2 without trusting their URLs or paths.
                 suffix = Path(str(record.get("file", ""))).suffix.lower()
-                kind = "audio" if suffix == ".mp3" else "image" if suffix in {
+                kind = "audio" if suffix in {".mp3", ".wav"} else "image" if suffix in {
                     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"} else None
             if kind not in {"audio", "image"}:
                 raise ValueError("invalid failure kind")
@@ -582,9 +656,12 @@ def build_jobs(songs, args, failures):
         force = song_id in (args.redownload or []) or args.retry_failed
         fresh = song_id in (args.redownload or [])
         if not args.retry_failed or (song_id, "audio") in failures:
+            source = song.get("song_path") if isinstance(song.get("song_path"), str) else ""
+            extension = Path(urlsplit(source).path).suffix.lower()
+            if extension not in {".mp3", ".wav"}:
+                extension = ".mp3"  # The response bytes determine the final extension.
             jobs.append(Job(song_id, BASE + "/api/download-song?" + urlencode({"id": song_id}),
-                            args.output / "songs" / (stem + ".mp3"), "audio", force, fresh,
-                            song.get("song_path") if isinstance(song.get("song_path"), str) else ""))
+                            args.output / "songs" / (stem + extension), "audio", force, fresh, source))
         want_image = ((song_id, "image") in failures if args.retry_failed else args.artwork)
         image = song.get("image_path")
         if want_image and not image and args.retry_failed:
@@ -661,7 +738,7 @@ def run_downloads(client, jobs, history, failure_path, failures, workers, skippe
             return
         try:
             status = future.result()
-            history.record(job.song_id, job.kind, job.destination,
+            history.record(job.song_id, job.kind, getattr(status, "path", job.destination),
                            job.source if status == "downloaded" else None)
         except (OSError, ValueError, RuntimeError, http.client.HTTPException, DownloadCancelled) as error:
             progress.finish(job.kind, "failed")
@@ -729,7 +806,7 @@ def local_audio_sizes(songs, history, output):
         if not folder.is_dir():
             continue
         for path in folder.iterdir():
-            if path.suffix.lower() != ".mp3" or not path.is_file():
+            if path.suffix.lower() not in {".mp3", ".wav"} or not path.is_file():
                 continue
             song_id = identifiers.get(path.stem.rpartition(" [")[2])
             if song_id in history.completed["audio"]:

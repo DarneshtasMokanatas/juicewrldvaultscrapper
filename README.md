@@ -6,8 +6,8 @@ It saves catalog metadata, retries temporary network failures, and skips files
 it has already downloaded. No account, API key, or additional Python packages
 are required.
 
-Version **1.4.0** also tracks catalog audio paths to detect changed versions,
-with an optional remote-size comparison for changes at the same path.
+Version **1.5.0** saves MP3 and RIFF/WAV audio with their correct extensions,
+without converting audio or rewriting the files' embedded metadata.
 
 This is an unofficial tool. It downloads public catalog tracks, rather than
 mirroring the entire website or discovering hidden files. The site's endpoints
@@ -50,6 +50,9 @@ To download the full public catalog, remove `--limit 1`:
 py -3 .\download_juicewrldvault.py --artwork
 ```
 
+The catalog can contain formats other than MP3 and WAV. This version reports
+those tracks as unsupported rather than saving them with a misleading extension.
+
 The default output folder is `Downloads/juicewrldvault` under your home folder.
 The script prints the absolute location at startup. A large catalog can take
 considerable time and disk space; the script does not estimate its total size.
@@ -77,7 +80,11 @@ py -3 .\download_juicewrldvault.py --search "night" --type raw --limit 5
 
 Repeat `--song-id` to choose multiple IDs. Exact IDs, text, and type filters
 intersect; `--limit` applies after filtering in catalog order. Unknown explicit
-IDs cause an error before any media downloads.
+IDs cause an error before any media downloads. Filenames use the catalog's title,
+artist, and a stable track ID; characters that a filesystem cannot use are
+replaced. The full catalog metadata remains in `catalog.json`. Audio bytes and
+embedded tags are left exactly as supplied by the server, so the original tags
+may differ from the catalog title or artist.
 
 ## Retry or replace files
 
@@ -207,7 +214,7 @@ juicewrldvault/
   catalog.json       Full track metadata returned by the site
   failures.json      Unresolved failed, queued, or interrupted files
   .download.lock     Output-folder lock (leave this file in place)
-  songs/            MP3 files with track IDs to distinguish versions
+  songs/            MP3 or WAV files with track IDs to distinguish versions
   artwork/          Cover images, when --artwork is used
 ```
 
@@ -220,9 +227,13 @@ are recorded automatically. Interrupted files remain as
 the required range and validation headers; otherwise they restart safely.
 Keep these files if you plan to resume.
 
-Audio checks cover nonempty content, HTTP sizes when supplied, and complete
-MPEG Layer III frames, including MPEG-1/2/2.5, variable bitrates, ID3 tags, and APE
-tags. Free-format MP3 bitrates are unsupported. Artwork uses basic format
+Audio checks cover nonempty content, HTTP sizes when supplied, MP3 frame
+boundaries, and standard RIFF/WAV chunk boundaries. MP3 support includes
+MPEG-1/2/2.5, variable bitrates, ID3 tags, and APE tags. Free-format MP3
+bitrates and RF64 WAV files are unsupported. The detected bytes determine the
+extension of each completed download; neither format is transcoded. Previously
+downloaded WAV audio mistakenly named `.mp3` can be recognized when scanning
+history, but is not renamed automatically. Artwork uses basic format
 signatures/end markers or container sizes. Newly recorded file sizes are also
 kept in history to detect changed local files. Invalid local copies lose their
 completion record and can be fetched again. Legacy history files remain readable.
@@ -270,8 +281,8 @@ unfiltered retry), `2` for invalid arguments, and `130` for Ctrl+C.
   path, then rerun with the same output folder.
 - **Cannot lock output/history:** Close the other downloader that uses that
   folder or history. A leftover lock file itself does not block a new run.
-- **Invalid/unsupported MP3 or artwork:** The response may be incomplete, an
-  error page, or an unsupported format. Review `failures.json` and try
+- **Invalid/unsupported audio or artwork:** The response may be incomplete, an
+  error page, or a format other than MP3 or RIFF/WAV. Review `failures.json` and try
   `--retry-failed` later; use `--redownload ID` for a fresh transfer.
 
 ## Offline tests
